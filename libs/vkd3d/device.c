@@ -99,6 +99,9 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
 #ifdef _WIN32
     VK_EXTENSION(KHR_EXTERNAL_MEMORY_WIN32, KHR_external_memory_win32),
     VK_EXTENSION(KHR_EXTERNAL_SEMAPHORE_WIN32, KHR_external_semaphore_win32),
+#else
+    VK_EXTENSION(KHR_EXTERNAL_MEMORY_FD, KHR_external_memory_fd),
+    VK_EXTENSION(EXT_EXTERNAL_MEMORY_DMA_BUF, EXT_external_memory_dma_buf),
 #endif
     VK_EXTENSION(KHR_INDEX_TYPE_UINT8, KHR_index_type_uint8),
     VK_EXTENSION(KHR_SHADER_FLOAT_CONTROLS_2, KHR_shader_float_controls2),
@@ -7707,7 +7710,28 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
     FIXME("Creating shared handle for type of object %p unsupported.\n", object);
     return E_NOTIMPL;
 #else
-    FIXME("CreateSharedHandle can only be implemented in native Win32.\n");
+    struct d3d12_device *device = impl_from_ID3D12Device(iface);
+    ID3D12Resource *resource_iface;
+
+    TRACE("iface %p, object %p, attributes %p, access %#x, name %p, handle %p\n",
+            iface, object, attributes, (int)access, name, handle);
+
+    if (attributes)
+        FIXME("attributes %p not handled.\n", attributes);
+    if (name)
+        FIXME("name %p not handled.\n", name);
+
+    if (SUCCEEDED(ID3D12DeviceChild_QueryInterface(object, &IID_ID3D12Resource, (void **)&resource_iface)))
+    {
+        struct d3d12_resource *resource = impl_from_ID3D12Resource(resource_iface);
+        HRESULT hr;
+
+        hr = d3d12_resource_get_native_shared_descriptor(resource, device, handle);
+        ID3D12Resource_Release(resource_iface);
+        return hr;
+    }
+
+    FIXME("Creating shared handle for type of object %p unsupported on native builds.\n", object);
     return E_NOTIMPL;
 #endif
 }
@@ -8425,7 +8449,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_OpenExistingHeapFromAddress1(
     heap_desc.Properties.VisibleNodeMask = 1;
     heap_desc.SizeInBytes = size;
 
-    if (FAILED(hr = d3d12_heap_create(device, &heap_desc, (void *)address, &object)))
+    if (FAILED(hr = d3d12_heap_create(device, &heap_desc, (void *)address, 0, &object)))
     {
         if (ppHeap)
             *ppHeap = NULL;
@@ -8434,6 +8458,54 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_OpenExistingHeapFromAddress1(
 
     return return_interface(&object->ID3D12Heap_iface, &IID_ID3D12Heap, riid, ppHeap);
 }
+
+#ifndef _WIN32
+/* Native-only export: dmabuf-import twin of
+ * ID3D12Device13::OpenExistingHeapFromAddress1.  The heap's
+ * VkDeviceMemory is a VkImportMemoryFdInfoKHR DMA_BUF import of
+ * dmabuf_fd (e.g. a udmabuf wrapping memfd/shmem pages that RADV's
+ * userptr path refuses to import as a host pointer).  The fd is
+ * borrowed: dup()ed internally, caller keeps ownership.
+ * Declared in include/vkd3d_native_shared.h; the d3d12 loader
+ * forwards its identically-named export here via dlsym. */
+__attribute__((visibility("default")))
+HRESULT vkd3d_open_existing_heap_from_dmabuf(ID3D12Device *device_iface,
+        int dmabuf_fd, UINT64 size, REFIID iid, void **heap)
+{
+    struct d3d12_device *device = unsafe_impl_from_ID3D12Device((d3d12_device_iface *)device_iface);
+    D3D12_HEAP_DESC heap_desc;
+    struct d3d12_heap *object;
+    HRESULT hr;
+
+    TRACE("device %p, dmabuf_fd %d, size %"PRIu64", iid %s, heap %p\n",
+            device_iface, dmabuf_fd, size, debugstr_guid(iid), heap);
+
+    if (heap)
+        *heap = NULL;
+    if (!device || dmabuf_fd < 0 || !size)
+        return E_INVALIDARG;
+
+    /* Same shape as OpenExistingHeapFromAddress1's heap, minus the
+     * SHARED/SHARED_CROSS_ADAPTER flags: those would force every
+     * placed resource to declare ALLOW_CROSS_ADAPTER, and unlike the
+     * host-pointer path we don't need them (the import is a plain
+     * dmabuf VkDeviceMemory). */
+    memset(&heap_desc, 0, sizeof(heap_desc));
+    heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    heap_desc.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+    heap_desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+    heap_desc.Properties.CreationNodeMask = 1;
+    heap_desc.Properties.VisibleNodeMask = 1;
+    heap_desc.SizeInBytes = size;
+
+    if (FAILED(hr = d3d12_heap_create(device, &heap_desc, NULL, dmabuf_fd, &object)))
+        return hr;
+
+    return return_interface(&object->ID3D12Heap_iface, &IID_ID3D12Heap, iid, heap);
+}
+#endif /* !_WIN32 */
 
 static HRESULT STDMETHODCALLTYPE d3d12_device_OpenExistingHeapFromAddress(d3d12_device_iface *iface,
         const void *address, REFIID riid, void **heap)
@@ -8578,7 +8650,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateHeap1(d3d12_device_iface *if
     if (protected_session)
         FIXME("Ignoring protected session %p.\n", protected_session);
 
-    if (FAILED(hr = d3d12_heap_create(device, desc, NULL, &object)))
+    if (FAILED(hr = d3d12_heap_create(device, desc, NULL, 0, &object)))
     {
         *heap = NULL;
         return hr;

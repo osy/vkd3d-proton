@@ -42,6 +42,9 @@
 #include "vkd3d_string.h"
 #include "vkd3d_file_utils.h"
 #include "vkd3d_native_sync_handle.h"
+#ifndef _WIN32
+#include "vkd3d_native_shared.h"
+#endif
 #include "config_flags.h"
 #include "copy_utils.h"
 #include <assert.h>
@@ -137,6 +140,8 @@ struct vkd3d_vulkan_info
     bool KHR_fragment_shader_barycentric;
     bool KHR_external_memory_win32;
     bool KHR_external_semaphore_win32;
+    bool KHR_external_memory_fd;
+    bool EXT_external_memory_dma_buf;
     bool KHR_present_wait2;
     bool KHR_present_id2;
     bool KHR_present_wait;
@@ -788,6 +793,10 @@ enum vkd3d_allocation_flag
      * and we do not consume space in the VA map. */
     VKD3D_ALLOCATION_FLAG_INTERNAL_SCRATCH  = (1u << 6),
     VKD3D_ALLOCATION_FLAG_ALLOW_IMAGE_SUBALLOCATION  = (1u << 7),
+    /* cpu_address is an mmap() of the imported dmabuf fd
+     * (amdgpu SIGBUSes on CPU access through vkMapMemory of an
+     * SG-imported BO); munmap it on free. */
+    VKD3D_ALLOCATION_FLAG_DMABUF_CPU_MAP    = (1u << 8),
 };
 
 #define VKD3D_MEMORY_CHUNK_SIZE (VKD3D_VA_BLOCK_SIZE * 8)
@@ -802,6 +811,12 @@ struct vkd3d_allocate_memory_info
     D3D12_HEAP_PROPERTIES heap_properties;
     D3D12_HEAP_FLAGS heap_flags;
     void *host_ptr;
+    /* > 0 imports this dmabuf as the backing VkDeviceMemory
+     * (VkImportMemoryFdInfoKHR) instead of allocating.  The fd is
+     * borrowed; the import dup()s internally.  0 = none, so the
+     * ubiquitous memset-zero initialization keeps existing callers
+     * unchanged. */
+    int import_fd;
     const void *pNext;
     uint32_t flags;
     VkBufferUsageFlags2KHR explicit_global_buffer_usage;
@@ -813,6 +828,8 @@ struct vkd3d_allocate_heap_memory_info
 {
     D3D12_HEAP_DESC heap_desc;
     void *host_ptr;
+    /* See vkd3d_allocate_memory_info::import_fd. */
+    int import_fd;
     uint32_t extra_allocation_flags;
     float vk_memory_priority;
     VkBufferUsageFlags2KHR explicit_global_buffer_usage;
@@ -1046,8 +1063,10 @@ struct d3d12_heap
     struct d3d_destruction_notifier destruction_notifier;
 };
 
+/* import_fd > 0 imports the dmabuf as the heap's memory;
+ * mutually exclusive with host_address.  Pass 0 for no import. */
 HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
-        void *host_address, struct d3d12_heap **heap);
+        void *host_address, int import_fd, struct d3d12_heap **heap);
 HRESULT d3d12_device_validate_custom_heap_type(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties);
 
@@ -1081,7 +1100,9 @@ enum vkd3d_resource_flag
     VKD3D_RESOURCE_ZERO_INITIALIZED       = (1u << 8),
     VKD3D_RESOURCE_RETAINED_GPU_REFERENCE = (1u << 9),
     VKD3D_RESOURCE_COPY_QUEUE_COMPATIBLE  = (1u << 10),
-    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11)
+    VKD3D_RESOURCE_INPUT_ATTACHMENT       = (1u << 11),
+    /* Native-only: shared resource exports its dmabuf with LINEAR tiling. */
+    VKD3D_RESOURCE_LINEAR_DMABUF_EXPORT   = (1u << 12)
 };
 
 #define VKD3D_INVALID_TILE_INDEX (~0u)
@@ -1202,6 +1223,12 @@ struct d3d12_resource
 
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
+
+#ifndef _WIN32
+    /* Lazily built descriptor returned by ID3D12Device::CreateSharedHandle on
+     * native builds.  Owned by the resource (including the dmabuf fd). */
+    struct DxvkSharedTextureDescriptor *native_shared_descriptor;
+#endif
 };
 
 static inline bool d3d12_resource_is_buffer(const struct d3d12_resource *resource)
@@ -1277,6 +1304,10 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
         const D3D12_CLEAR_VALUE *optimized_clear_value,
         UINT num_castable_formats, const DXGI_FORMAT *castable_formats,
         struct d3d12_resource **resource);
+#ifndef _WIN32
+HRESULT d3d12_resource_get_native_shared_descriptor(struct d3d12_resource *resource,
+        struct d3d12_device *device, HANDLE *handle);
+#endif
 
 static inline struct d3d12_resource *impl_from_ID3D12Resource2(ID3D12Resource2 *iface)
 {
@@ -7082,6 +7113,7 @@ typedef struct D3D11_TEXTURE3D_DESC
     UINT MiscFlags;
 } D3D11_TEXTURE3D_DESC;
 
+#ifdef _WIN32
 struct DxvkSharedTextureMetadata {
     UINT             Width;
     UINT             Height;
@@ -7095,6 +7127,7 @@ struct DxvkSharedTextureMetadata {
     UINT             MiscFlags;
     D3D11_TEXTURE_LAYOUT TextureLayout;
 };
+#endif  /* On native builds, vkd3d_native_shared.h provides the layout-identical definition. */
 
 bool vkd3d_set_shared_metadata(HANDLE handle, void *buf, uint32_t buf_size);
 bool vkd3d_get_shared_metadata(HANDLE handle, void *buf, uint32_t buf_size, uint32_t *metadata_size);

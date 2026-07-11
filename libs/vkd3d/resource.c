@@ -21,6 +21,9 @@
 
 #include <float.h>
 #include <math.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "vkd3d_private.h"
 #include "vkd3d_d3dkmt.h"
@@ -745,9 +748,20 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
 
     if (resource && (resource->heap_flags & D3D12_HEAP_FLAG_SHARED))
     {
+#ifdef _WIN32
         external_info->sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
         external_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
         vk_prepend_struct(image_info, external_info);
+#else
+        if (device->vk_info.KHR_external_memory_fd && device->vk_info.EXT_external_memory_dma_buf)
+        {
+            external_info->sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+            external_info->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            vk_prepend_struct(image_info, external_info);
+        }
+        else
+            FIXME("D3D12_HEAP_FLAG_SHARED requires VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf.\n");
+#endif
     }
 
     disable_compression = false;
@@ -906,6 +920,13 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
     image_info->samples = vk_samples_from_dxgi_sample_desc(&desc->SampleDesc);
     image_info->tiling = format->vk_image_tiling;
     image_info->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+#ifndef _WIN32
+    /* Linear-forced dmabuf export (VKD3D_HEAP_FLAG_EXPORT_LINEAR_DMABUF):
+     * the exported image must have no tiling ambiguity (DRM_FORMAT_MOD_LINEAR). */
+    if (resource && (resource->flags & VKD3D_RESOURCE_LINEAR_DMABUF_EXPORT))
+        image_info->tiling = VK_IMAGE_TILING_LINEAR;
+#endif
 
     if (resource && (resource->flags & VKD3D_RESOURCE_COMMITTED) &&
             device->device_info.zero_initialize_device_memory_features.zeroInitializeDeviceMemory &&
@@ -4004,6 +4025,15 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
 
     d3d12_resource_close_export_kmt(resource, device);
 
+#ifndef _WIN32
+    if (resource->native_shared_descriptor)
+    {
+        if (resource->native_shared_descriptor->fd >= 0)
+            close(resource->native_shared_descriptor->fd);
+        vkd3d_free(resource->native_shared_descriptor);
+    }
+#endif
+
     if ((resource->flags & VKD3D_RESOURCE_ALLOCATION) && resource->mem.device_allocation.vk_memory)
         vkd3d_free_memory(device, &device->memory_allocator, &resource->mem);
 
@@ -4324,10 +4354,24 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
         HANDLE shared_handle, struct d3d12_resource **resource)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    uint32_t resource_flags = VKD3D_RESOURCE_COMMITTED | VKD3D_RESOURCE_ALLOCATION;
     struct d3d12_resource *object;
     HRESULT hr;
 
-    if (FAILED(hr = d3d12_resource_create(device, VKD3D_RESOURCE_COMMITTED | VKD3D_RESOURCE_ALLOCATION,
+#ifndef _WIN32
+    /* Vendor heap flag: strip it before vkd3d's validation / bookkeeping
+     * sees it, and record it on the resource instead. */
+    if (heap_flags & VKD3D_HEAP_FLAG_EXPORT_LINEAR_DMABUF)
+    {
+        heap_flags &= ~VKD3D_HEAP_FLAG_EXPORT_LINEAR_DMABUF;
+        if (heap_flags & D3D12_HEAP_FLAG_SHARED)
+            resource_flags |= VKD3D_RESOURCE_LINEAR_DMABUF_EXPORT;
+        else
+            WARN("VKD3D_HEAP_FLAG_EXPORT_LINEAR_DMABUF without D3D12_HEAP_FLAG_SHARED, ignoring.\n");
+    }
+#endif
+
+    if (FAILED(hr = d3d12_resource_create(device, resource_flags,
             desc, heap_properties, heap_flags, initial_state, optimized_clear_value,
             num_castable_formats, castable_formats,
             &object)))
@@ -4426,7 +4470,19 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
                 allocate_info.pNext = &export_info;
             }
 #else
-            FIXME("D3D12_HEAP_FLAG_SHARED can only be implemented in native Win32.\n");
+            /* Native: export the dedicated allocation as a dmabuf so that
+             * CreateSharedHandle can hand out a DxvkSharedTextureDescriptor. */
+            dedicated_requirements.prefersDedicatedAllocation = VK_TRUE;
+
+            if (device->vk_info.KHR_external_memory_fd && device->vk_info.EXT_external_memory_dma_buf)
+            {
+                export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+                export_info.pNext = allocate_info.pNext;
+                export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+                allocate_info.pNext = &export_info;
+            }
+            else
+                FIXME("D3D12_HEAP_FLAG_SHARED requires VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf.\n");
 #endif
         }
 
@@ -4553,6 +4609,130 @@ fail:
     d3d12_resource_destroy_and_release_device(object, device);
     return hr;
 }
+
+#ifndef _WIN32
+static HRESULT d3d12_resource_build_native_shared_descriptor(struct d3d12_resource *resource,
+        struct d3d12_device *device, struct DxvkSharedTextureDescriptor **out_descriptor)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    struct DxvkSharedTextureDescriptor *descriptor;
+    VkImageSubresource subresource;
+    VkMemoryGetFdInfoKHR fd_info;
+    VkSubresourceLayout layout;
+    int fd = -1;
+    VkResult vr;
+
+    if (!device->vk_info.KHR_external_memory_fd || !device->vk_info.EXT_external_memory_dma_buf)
+    {
+        FIXME("Cannot export dmabuf without VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf.\n");
+        return E_NOTIMPL;
+    }
+
+    if (!(resource->flags & VKD3D_RESOURCE_COMMITTED))
+    {
+        FIXME("dmabuf export is only supported for committed resources.\n");
+        return E_NOTIMPL;
+    }
+
+    if (!(resource->flags & VKD3D_RESOURCE_LINEAR_DMABUF_EXPORT))
+    {
+        FIXME("dmabuf export of OPTIMAL tiling shared resources is not implemented; "
+                "create the resource with VKD3D_HEAP_FLAG_EXPORT_LINEAR_DMABUF.\n");
+        return E_NOTIMPL;
+    }
+
+    if (resource->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+        FIXME("dmabuf export is only supported for 2D textures.\n");
+        return E_NOTIMPL;
+    }
+
+    /* SHARED committed textures always take the dedicated allocation path;
+     * a suballocated image cannot be exported as its own dmabuf. */
+    if (resource->mem.chunk || resource->mem.offset)
+    {
+        ERR("Shared resource is unexpectedly suballocated (offset %"PRIu64").\n", resource->mem.offset);
+        return E_FAIL;
+    }
+
+    memset(&fd_info, 0, sizeof(fd_info));
+    fd_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+    fd_info.memory = resource->mem.device_allocation.vk_memory;
+    fd_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    if ((vr = VK_CALL(vkGetMemoryFdKHR(device->vk_device, &fd_info, &fd))) < 0)
+    {
+        ERR("Failed to export dmabuf from image memory, vr %d.\n", vr);
+        return hresult_from_vk_result(vr);
+    }
+
+    if (!(descriptor = vkd3d_calloc(1, sizeof(*descriptor))))
+    {
+        close(fd);
+        return E_OUTOFMEMORY;
+    }
+
+    memset(&subresource, 0, sizeof(subresource));
+    subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    VK_CALL(vkGetImageSubresourceLayout(device->vk_device, resource->res.vk_image, &subresource, &layout));
+
+    descriptor->magic = DXVK_SHARED_DESCRIPTOR_TEXTURE;
+    descriptor->version = DXVK_SHARED_DESCRIPTOR_VERSION;
+    descriptor->structSize = sizeof(*descriptor);
+
+    descriptor->meta.Width = resource->desc.Width;
+    descriptor->meta.Height = resource->desc.Height;
+    descriptor->meta.MipLevels = resource->desc.MipLevels;
+    descriptor->meta.ArraySize = resource->desc.DepthOrArraySize;
+    descriptor->meta.Format = resource->desc.Format;
+    descriptor->meta.SampleDesc.Count = resource->desc.SampleDesc.Count;
+    descriptor->meta.SampleDesc.Quality = resource->desc.SampleDesc.Quality;
+    descriptor->meta.Usage = D3D11_USAGE_DEFAULT;
+    descriptor->meta.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    descriptor->meta.CPUAccessFlags = 0;
+    descriptor->meta.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    descriptor->meta.TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
+
+    descriptor->drmFormatModifier = 0; /* DRM_FORMAT_MOD_LINEAR */
+    descriptor->planeCount = 1;
+    descriptor->planes[0].offset = layout.offset;
+    descriptor->planes[0].pitch = layout.rowPitch;
+    descriptor->allocationSize = resource->mem.device_allocation.size;
+    descriptor->fd = fd;
+
+    *out_descriptor = descriptor;
+    return S_OK;
+}
+
+HRESULT d3d12_resource_get_native_shared_descriptor(struct d3d12_resource *resource,
+        struct d3d12_device *device, HANDLE *handle)
+{
+    HRESULT hr = S_OK;
+
+    if (!(resource->heap_flags & D3D12_HEAP_FLAG_SHARED))
+        return DXGI_ERROR_INVALID_CALL;
+
+    if (d3d12_resource_is_buffer(resource))
+    {
+        FIXME("dmabuf export is only supported for texture resources.\n");
+        return E_NOTIMPL;
+    }
+
+    pthread_mutex_lock(&device->mutex);
+    if (!resource->native_shared_descriptor)
+    {
+        hr = d3d12_resource_build_native_shared_descriptor(resource,
+                device, &resource->native_shared_descriptor);
+    }
+    pthread_mutex_unlock(&device->mutex);
+
+    if (FAILED(hr))
+        return hr;
+
+    *handle = resource->native_shared_descriptor;
+    return S_OK;
+}
+#endif  /* !_WIN32 */
 
 static HRESULT d3d12_resource_validate_heap(const D3D12_RESOURCE_DESC1 *resource_desc, struct d3d12_heap *heap)
 {

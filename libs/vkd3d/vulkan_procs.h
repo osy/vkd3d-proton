@@ -260,6 +260,12 @@ VK_DEVICE_EXT_PFN(vkGetMemoryWin32HandleKHR)
 VK_DEVICE_EXT_PFN(vkGetMemoryWin32HandlePropertiesKHR)
 #endif
 
+#ifdef VK_KHR_external_memory_fd
+/* VK_KHR_external_memory_fd */
+VK_DEVICE_EXT_PFN(vkGetMemoryFdKHR)
+VK_DEVICE_EXT_PFN(vkGetMemoryFdPropertiesKHR)
+#endif
+
 #ifdef VK_KHR_external_semaphore_win32
 /* VK_KHR_external_semaphore_win32 */
 VK_DEVICE_EXT_PFN(vkGetSemaphoreWin32HandleKHR)

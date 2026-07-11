@@ -151,6 +151,39 @@ HRESULT WINAPI DLLEXPORT D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL 
     return IVKD3DCoreInterface_CreateDevice(core, adapter, minimum_feature_level, iid, device);
 }
 
+#if !defined(_WIN32)
+/* Forwarding stub for the native dmabuf-heap export
+ * (include/vkd3d_native_shared.h), so consumers that dlopen the
+ * LOADER module (libvkd3d-proton-d3d12.so) can dlsym it without
+ * knowing about d3d12core.  Resolved lazily from the d3d12core
+ * module the loader already dlopens. */
+typedef HRESULT (*PFN_vkd3d_open_existing_heap_from_dmabuf_fwd)(ID3D12Device *device,
+        int dmabuf_fd, UINT64 size, REFIID iid, void **heap);
+
+HRESULT DLLEXPORT vkd3d_open_existing_heap_from_dmabuf(ID3D12Device *device,
+        int dmabuf_fd, UINT64 size, REFIID iid, void **heap)
+{
+    static PFN_vkd3d_open_existing_heap_from_dmabuf_fwd pfn;
+
+    TRACE("device %p, dmabuf_fd %d, size %"PRIu64", iid %s, heap %p.\n",
+            device, dmabuf_fd, size, debugstr_guid(iid), heap);
+
+    if (!load_d3d12core())
+        return E_NOINTERFACE;
+
+    if (!pfn)
+        pfn = (PFN_vkd3d_open_existing_heap_from_dmabuf_fwd)vkd3d_dlsym(
+                d3d12core_module, "vkd3d_open_existing_heap_from_dmabuf");
+    if (!pfn)
+    {
+        ERR("d3d12core module lacks vkd3d_open_existing_heap_from_dmabuf.\n");
+        return E_NOTIMPL;
+    }
+
+    return pfn(device, dmabuf_fd, size, iid, heap);
+}
+#endif /* !_WIN32 */
+
 HRESULT WINAPI DLLEXPORT D3D12CreateRootSignatureDeserializer(const void *data, SIZE_T data_size,
         REFIID iid, void **deserializer)
 {

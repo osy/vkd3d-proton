@@ -290,7 +290,7 @@ static HRESULT validate_heap_desc(struct d3d12_device *device, const D3D12_HEAP_
 }
 
 static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *device,
-        const D3D12_HEAP_DESC *desc, void* host_address)
+        const D3D12_HEAP_DESC *desc, void* host_address, int import_fd)
 {
     struct vkd3d_allocate_heap_memory_info alloc_info;
     bool accept_small_image_heaps;
@@ -320,6 +320,7 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
     memset(&alloc_info, 0, sizeof(alloc_info));
     alloc_info.heap_desc = heap->desc;
     alloc_info.host_ptr = host_address;
+    alloc_info.import_fd = import_fd;
 
     /* If we have pageable support, we want to be able to take advantage of that for smaller heaps,
      * since it seems to matter for memory management on e.g. Steam Machine.
@@ -402,7 +403,7 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
 }
 
 HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
-        void* host_address, struct d3d12_heap **heap)
+        void* host_address, int import_fd, struct d3d12_heap **heap)
 {
     struct d3d12_heap *object;
     HRESULT hr;
@@ -410,7 +411,7 @@ HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *de
     if (!(object = vkd3d_malloc(sizeof(*object))))
         return E_OUTOFMEMORY;
 
-    if (FAILED(hr = d3d12_heap_init(object, device, desc, host_address)))
+    if (FAILED(hr = d3d12_heap_init(object, device, desc, host_address, import_fd)))
     {
         vkd3d_free(object);
         return hr;

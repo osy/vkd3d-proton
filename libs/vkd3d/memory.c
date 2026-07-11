@@ -21,6 +21,11 @@
 #include "vkd3d_private.h"
 #include "vkd3d_descriptor_debug.h"
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 static bool vkd3d_memory_transfer_queue_wait_semaphore(struct vkd3d_memory_transfer_queue *queue,
         uint64_t wait_value, uint64_t timeout);
 
@@ -1162,6 +1167,16 @@ static HRESULT vkd3d_import_host_memory(struct d3d12_device *device, void *host_
     {
         if (FAILED(hr))
             WARN("Failed to import host memory, hr %#x.\n", (int)hr);
+        /* The exporter of these pages keeps writing through its own
+         * mapping, so a silent fallback allocation means the GPU reads
+         * memory the app never writes.  Fail loudly instead so the
+         * caller can degrade to an explicit copy path. */
+        if (VKD3D_CONFIG_FLAG_IS_SET(REQUIRE_HOST_IMPORT))
+        {
+            ERR("Host memory import failed (hr %#x) and require_host_import is set; refusing plain-allocation fallback.\n",
+                    (int)hr);
+            return FAILED(hr) ? hr : E_INVALIDARG;
+        }
         /* If we failed, fall back to a host-visible allocation. Generally
          * the app will access the memory thorugh the main host pointer,
          * so it's fine. */
@@ -1171,6 +1186,110 @@ static HRESULT vkd3d_import_host_memory(struct d3d12_device *device, void *host_
     }
 
     return hr;
+}
+
+/* Import a dmabuf (e.g. a udmabuf wrapping shmem pages) as the
+ * allocation's VkDeviceMemory, so the GPU aliases the exact
+ * pages the exporter mapped.  The fd is borrowed: Vulkan consumes the
+ * internal dup() on VK_SUCCESS only. */
+static HRESULT vkd3d_import_dmabuf_memory(struct d3d12_device *device, int dmabuf_fd,
+        VkDeviceSize size, VkMemoryPropertyFlags type_flags, uint32_t type_mask,
+        void *pNext, bool *out_imported, struct vkd3d_device_memory_allocation *allocation)
+{
+#ifdef _WIN32
+    (void)device; (void)dmabuf_fd; (void)size;
+    (void)type_flags; (void)type_mask; (void)pNext; (void)allocation;
+    *out_imported = false;
+    ERR("dmabuf import is not available on Win32.\n");
+    return E_NOTIMPL;
+#else
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    static const VkMemoryPropertyFlags fallback_flags =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    VkImportMemoryFdInfoKHR import_info;
+    VkMemoryFdPropertiesKHR fd_props;
+    uint32_t plain_type_mask = type_mask;
+    HRESULT hr;
+    VkResult vr;
+    int fd;
+
+    *out_imported = false;
+
+    if (!device->vk_info.KHR_external_memory_fd || !device->vk_info.EXT_external_memory_dma_buf)
+    {
+        ERR("dmabuf import requires VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf.\n");
+        return E_NOTIMPL;
+    }
+
+    memset(&fd_props, 0, sizeof(fd_props));
+    fd_props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+
+    if ((vr = VK_CALL(vkGetMemoryFdPropertiesKHR(device->vk_device,
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dmabuf_fd, &fd_props))) < 0)
+    {
+        ERR("vkGetMemoryFdPropertiesKHR failed for dmabuf fd %d, vr %d.\n", dmabuf_fd, vr);
+        return hresult_from_vk_result(vr);
+    }
+
+    type_mask &= fd_props.memoryTypeBits;
+    if (!type_mask)
+    {
+        ERR("No usable memory type for dmabuf import (heap mask %#x, fd props %#x).\n",
+                plain_type_mask, fd_props.memoryTypeBits);
+        hr = E_INVALIDARG;
+        goto fallback;
+    }
+
+    /* vkAllocateMemory consumes the fd on VK_SUCCESS only; a failed
+     * attempt leaves ownership with us so the fd can be retried. */
+    if ((fd = dup(dmabuf_fd)) < 0)
+    {
+        ERR("Failed to dup dmabuf fd %d.\n", dmabuf_fd);
+        return E_OUTOFMEMORY;
+    }
+
+    import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+    import_info.pNext = pNext;
+    import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    import_info.fd = fd;
+
+    hr = vkd3d_try_allocate_device_memory(device, size,
+            type_flags, type_mask, &import_info, true, allocation);
+    if (FAILED(hr) && type_flags != fallback_flags)
+    {
+        /* The heap's preferred flags (e.g. +HOST_CACHED) may not exist
+         * among the fd's memory types; HOST_VISIBLE|HOST_COHERENT is
+         * the functional minimum for a CPU heap. */
+        hr = vkd3d_try_allocate_device_memory(device, size,
+                fallback_flags, type_mask, &import_info, true, allocation);
+    }
+
+    if (FAILED(hr))
+    {
+        close(fd);
+        ERR("Failed to import dmabuf memory (fd %d, size %"PRIu64", type_mask %#x), hr %#x.\n",
+                dmabuf_fd, size, type_mask, (int)hr);
+        goto fallback;
+    }
+
+    *out_imported = true;
+    return hr;
+
+fallback:
+    /* Mirror vkd3d_import_host_memory's stock behavior: fall back to a
+     * plain allocation unless require_host_import demands loud failure
+     * (a silent fallback means the GPU reads pages the exporting side
+     * never writes). */
+    if (VKD3D_CONFIG_FLAG_IS_SET(REQUIRE_HOST_IMPORT))
+    {
+        ERR("dmabuf import failed (hr %#x) and require_host_import is set; refusing plain-allocation fallback.\n",
+                (int)hr);
+        return hr;
+    }
+    WARN("Falling back to plain allocation for dmabuf import; CPU writes through the dmabuf will NOT be visible to the GPU.\n");
+    return vkd3d_try_allocate_device_memory(device, size,
+            fallback_flags, plain_type_mask, pNext, true, allocation);
+#endif
 }
 
 static HRESULT vkd3d_allocation_assign_gpu_address(struct vkd3d_memory_allocation *allocation,
@@ -1271,6 +1390,11 @@ static void vkd3d_memory_allocation_free(const struct vkd3d_memory_allocation *a
     if (allocation->flags & VKD3D_ALLOCATION_FLAG_ALLOW_WRITE_WATCH)
         vkd3d_free_write_watch_pointer(allocation->cpu_address);
 
+#ifndef _WIN32
+    if ((allocation->flags & VKD3D_ALLOCATION_FLAG_DMABUF_CPU_MAP) && allocation->cpu_address)
+        munmap(allocation->cpu_address, allocation->resource.size);
+#endif
+
     if ((allocation->flags & VKD3D_ALLOCATION_FLAG_GPU_ADDRESS) && allocation->resource.va &&
             !(allocation->flags & VKD3D_ALLOCATION_FLAG_INTERNAL_SCRATCH))
     {
@@ -1293,7 +1417,7 @@ static bool vkd3d_is_imported_allocation(const struct vkd3d_allocate_memory_info
 {
     const VkBaseInStructure *next = info->pNext;
 
-    if (info->host_ptr)
+    if (info->host_ptr || info->import_fd > 0)
         return true;
 
     while (next)
@@ -1317,6 +1441,7 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
     VkMemoryPropertyFlags type_flags;
     VkBindBufferMemoryInfo bind_info;
     void *host_ptr = info->host_ptr;
+    bool dmabuf_imported = false;
     void *dummy_mapping;
     uint32_t type_mask;
     bool request_bda;
@@ -1463,7 +1588,13 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
         vk_prepend_struct(&flags_info, &priority_info);
     }
 
-    if (host_ptr)
+    if (info->import_fd > 0)
+    {
+        hr = vkd3d_import_dmabuf_memory(device, info->import_fd, memory_requirements.size,
+                type_flags, type_mask, &flags_info, &dmabuf_imported,
+                &allocation->device_allocation);
+    }
+    else if (host_ptr)
     {
         hr = vkd3d_import_host_memory(device, host_ptr, memory_requirements.size,
                 type_flags, type_mask, &flags_info, &allocation->device_allocation);
@@ -1488,6 +1619,28 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
     /* Map memory if the allocation was requested to be host-visible,
      * but do not map if the allocation was meant to be device-local
      * since that may negatively impact performance. */
+#ifndef _WIN32
+    if (dmabuf_imported)
+    {
+        /* CPU access must go through an mmap of the dmabuf itself:
+         * amdgpu TTM refuses CPU faults on SG-imported BOs, so a
+         * vkMapMemory pointer would SIGBUS.  For udmabuf this maps the
+         * very shmem pages the exporter wrote. */
+        void *map = mmap(NULL, memory_requirements.size, PROT_READ | PROT_WRITE,
+                MAP_SHARED, info->import_fd, 0);
+        if (map == MAP_FAILED)
+        {
+            ERR("Failed to mmap imported dmabuf fd %d (size %"PRIu64").\n",
+                    info->import_fd, memory_requirements.size);
+            vkd3d_memory_allocation_free(allocation, device, allocator);
+            return E_INVALIDARG;
+        }
+        allocation->flags |= VKD3D_ALLOCATION_FLAG_CPU_ACCESS |
+                VKD3D_ALLOCATION_FLAG_DMABUF_CPU_MAP;
+        allocation->cpu_address = map;
+    }
+    else
+#endif
     if (host_ptr)
     {
         /* D3D12 expects us to forward the host pointer as-is. Map the memory
@@ -2051,8 +2204,8 @@ bool vkd3d_allocate_image_memory_prefers_dedicated(struct d3d12_device *device,
 static bool vkd3d_memory_info_allow_suballocate(struct d3d12_device *device,
         const struct vkd3d_allocate_memory_info *info)
 {
-    /* pNext implies dedicated allocation or similar. Host pointer implies external memory import. */
-    if (info->pNext || info->host_ptr)
+    /* pNext implies dedicated allocation or similar. Host pointer / dmabuf fd implies external memory import. */
+    if (info->pNext || info->host_ptr || info->import_fd > 0)
         return false;
 
     /* We must never suballocate these. */
@@ -2176,6 +2329,7 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
     alloc_info.heap_properties = info->heap_desc.Properties;
     alloc_info.heap_flags = info->heap_desc.Flags;
     alloc_info.host_ptr = info->host_ptr;
+    alloc_info.import_fd = info->import_fd;
     alloc_info.vk_memory_priority = info->vk_memory_priority;
     alloc_info.explicit_global_buffer_usage = info->explicit_global_buffer_usage;
 

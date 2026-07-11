@@ -152,6 +152,42 @@ as many games will only even attempt to load d3d12.dll if they are running on Wi
 A native Linux binary can be built, but it is not intended to be compatible with upstream Wine.
 A native option is mostly relevant for development purposes for the time being.
 
+#### dma-buf interop
+
+Native builds install `include/vkd3d-proton/vkd3d_native_shared.h`, which declares the
+dma-buf interop surface used to share memory with other Linux clients (compositors,
+DXVK's native dmabuf presenter, or a host process re-hosting a client's D3D12 calls).
+
+Exporting a texture: `ID3D12Device::CreateSharedHandle()` on a committed texture created
+with `D3D12_HEAP_FLAG_SHARED` returns, as the `HANDLE`, a pointer to a
+`struct DxvkSharedTextureDescriptor` carrying a dma-buf fd plus the plane offsets/pitches,
+DRM format modifier and allocation size needed to reimport the image. The layout is
+byte-compatible with DXVK's `dxvk_shared_resource.h`, so a consumer can accept descriptors
+from either implementation. The descriptor and its fd are owned by the exporting resource
+and die with it; `dup()` the fd to outlive the exporter. Adding the vendor heap flag
+`VKD3D_HEAP_FLAG_EXPORT_LINEAR_DMABUF` (`0x40000000`) forces the exported image to
+`VK_IMAGE_TILING_LINEAR` (`DRM_FORMAT_MOD_LINEAR`), so consumers that cannot negotiate
+modifiers can still scan it out. Exports are currently linear-only; an optimal-tiling
+export fails rather than handing back an unusable fd.
+
+Importing memory: `vkd3d_open_existing_heap_from_dmabuf()` is a dma-buf twin of
+`ID3D12Device13::OpenExistingHeapFromAddress1()`. It returns an `ALLOW_ONLY_BUFFERS`
+CUSTOM/WRITE_BACK heap whose `VkDeviceMemory` is a
+`VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT` import of the given fd, so placed
+resources alias the exporter's pages instead of a copy of them. `size` must match the
+dma-buf and be 64 KiB-aligned; the fd is borrowed (dup()ed internally, caller keeps
+ownership). This exists because the host-pointer path is not always usable for
+externally-allocated pages — RADV refuses `VK_EXT_external_memory_host` imports of shmem
+pages, e.g. a udmabuf-wrapped memfd. The heap's CPU address comes from `mmap()`ing the
+dma-buf fd rather than from `vkMapMemory()`, since CPU access through a mapped
+SG-imported BO faults on amdgpu. The symbol is exported from both `d3d12core` and the
+`d3d12` loader (which forwards to it via `dlsym`), so `dlsym()` on either module works.
+
+Both import paths (host pointer and dma-buf) silently fall back to a plain allocation if
+the import fails. See `VKD3D_CONFIG=require_host_import` below to turn that into a hard
+failure, which is what you want when the imported pages are written by someone else and a
+fallback allocation would leave the GPU reading memory nobody updates.
+
 ## Environment variables
 
 Most of the environment variables used by vkd3d-proton are for debugging purposes. The
@@ -176,6 +212,9 @@ commas or semicolons.
       so it should not be a real issue even on lower VRAM cards.
     - `force_host_cached` - Forces all host visible allocations to be CACHED, which greatly accelerates captures.
     - `no_invariant_position` - Avoids workarounds for invariant position. The workaround is enabled by default.
+    - `require_host_import` - Native builds only. Makes a failed memory import (host pointer or
+      dma-buf) fail the allocation instead of silently falling back to a plain one.
+      See "dma-buf interop" above.
  - `VKD3D_DEBUG` - controls the debug level for log messages produced by
    vkd3d-proton. Accepts the following values: none, err, info, fixme, warn, trace.
  - `VKD3D_SHADER_DEBUG` - controls the debug level for log messages produced by
