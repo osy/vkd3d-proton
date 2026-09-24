@@ -1477,10 +1477,16 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
         goto end;
     }
 
+    /* The entry point name only feeds the per-entry quirk table.  dxilconv
+     * (the D3D12 runtime's DXBC->DXIL converter) emits hull shaders whose
+     * dx.entryPoints node carries no function operand, so dxil-spirv lists
+     * no entry points for them although it converts them fine; rejecting
+     * the shader here dropped every tessellated draw of a DXBC title on a
+     * driver that advertises SM 6.  Match quirks by hash alone instead. */
     if (dxil_spv_parsed_blob_get_entry_point_demangled_name(blob, 0, &quirk_entry) != DXIL_SPV_SUCCESS)
     {
-        ret = VKD3D_ERROR_INVALID_SHADER;
-        goto end;
+        WARN("No entry point name for shader %016"PRIx64"; matching quirks by hash only.\n", hash);
+        quirk_entry = NULL;
     }
 
     quirks = vkd3d_shader_compile_arguments_select_quirks(compiler_args, hash, quirk_entry);
