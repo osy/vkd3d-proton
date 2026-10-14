@@ -4471,7 +4471,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
             }
 #else
             /* Native: export the dedicated allocation as a dmabuf so that
-             * CreateSharedHandle can hand out a DxvkSharedTextureDescriptor. */
+             * CreateSharedHandle can hand out a dxn_shared_texture. */
             dedicated_requirements.prefersDedicatedAllocation = VK_TRUE;
 
             if (device->vk_info.KHR_external_memory_fd && device->vk_info.EXT_external_memory_dma_buf)
@@ -4612,10 +4612,10 @@ fail:
 
 #ifndef _WIN32
 static HRESULT d3d12_resource_build_native_shared_descriptor(struct d3d12_resource *resource,
-        struct d3d12_device *device, struct DxvkSharedTextureDescriptor **out_descriptor)
+        struct d3d12_device *device, dxn_shared_texture **out_descriptor)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    struct DxvkSharedTextureDescriptor *descriptor;
+    dxn_shared_texture *descriptor;
     VkImageSubresource subresource;
     VkMemoryGetFdInfoKHR fd_info;
     VkSubresourceLayout layout;
@@ -4676,28 +4676,26 @@ static HRESULT d3d12_resource_build_native_shared_descriptor(struct d3d12_resour
     subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     VK_CALL(vkGetImageSubresourceLayout(device->vk_device, resource->res.vk_image, &subresource, &layout));
 
-    descriptor->magic = DXVK_SHARED_DESCRIPTOR_TEXTURE;
-    descriptor->version = DXVK_SHARED_DESCRIPTOR_VERSION;
-    descriptor->structSize = sizeof(*descriptor);
+    DXN_SHARED_INIT(descriptor, DXN_SHARED_TEXTURE_MAGIC);
 
-    descriptor->meta.Width = resource->desc.Width;
-    descriptor->meta.Height = resource->desc.Height;
-    descriptor->meta.MipLevels = resource->desc.MipLevels;
-    descriptor->meta.ArraySize = resource->desc.DepthOrArraySize;
-    descriptor->meta.Format = resource->desc.Format;
-    descriptor->meta.SampleDesc.Count = resource->desc.SampleDesc.Count;
-    descriptor->meta.SampleDesc.Quality = resource->desc.SampleDesc.Quality;
-    descriptor->meta.Usage = D3D11_USAGE_DEFAULT;
-    descriptor->meta.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    descriptor->meta.CPUAccessFlags = 0;
-    descriptor->meta.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-    descriptor->meta.TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
+    descriptor->meta.width = resource->desc.Width;
+    descriptor->meta.height = resource->desc.Height;
+    descriptor->meta.mip_levels = resource->desc.MipLevels;
+    descriptor->meta.array_size = resource->desc.DepthOrArraySize;
+    descriptor->meta.dxgi_format = resource->desc.Format;
+    descriptor->meta.sample_count = resource->desc.SampleDesc.Count;
+    descriptor->meta.sample_quality = resource->desc.SampleDesc.Quality;
+    descriptor->meta.usage = D3D11_USAGE_DEFAULT;
+    descriptor->meta.bind_flags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    descriptor->meta.cpu_access_flags = 0;
+    descriptor->meta.misc_flags = D3D11_RESOURCE_MISC_SHARED;
+    descriptor->meta.texture_layout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
 
-    descriptor->drmFormatModifier = 0; /* DRM_FORMAT_MOD_LINEAR */
-    descriptor->planeCount = 1;
+    descriptor->drm_modifier = 0; /* DRM_FORMAT_MOD_LINEAR */
+    descriptor->plane_count = 1;
     descriptor->planes[0].offset = layout.offset;
     descriptor->planes[0].pitch = layout.rowPitch;
-    descriptor->allocationSize = resource->mem.device_allocation.size;
+    descriptor->size = resource->mem.device_allocation.size;
     descriptor->fd = fd;
 
     *out_descriptor = descriptor;

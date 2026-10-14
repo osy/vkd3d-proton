@@ -47,6 +47,10 @@
 #define DLLEXPORT
 #endif
 
+#if !defined(_WIN32)
+#include <directx-native/dxn_embedder.h>
+#endif
+
 #include <inttypes.h>
 
 static pthread_once_t library_once = PTHREAD_ONCE_INIT;
@@ -152,6 +156,10 @@ HRESULT WINAPI DLLEXPORT D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL 
 }
 
 #if !defined(_WIN32)
+/* The directx-native embedder API (dxn_embedder.h) under vkd3d_: this
+ * loader module is what embedders dlopen as the D3D12 library. */
+DXN_DEFINE_NATIVE_ABI_VERSION(vkd3d_)
+
 /* Forwarding stub for the native dmabuf-heap export
  * (include/vkd3d_native_shared.h), so consumers that dlopen the
  * LOADER module (libvkd3d-proton-d3d12.so) can dlsym it without

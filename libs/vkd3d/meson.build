@@ -117,10 +117,10 @@ if enable_profiling
 endif
 
 vkd3d_lib = static_library('vkd3d-proton', vkd3d_src, glsl_generator.process(vkd3d_shaders), vkd3d_build, vkd3d_version,
-  dependencies        : [ vkd3d_common_dep, vkd3d_shader_dep ] + vkd3d_extra_libs,
+  dependencies        : [ vkd3d_common_dep, vkd3d_shader_dep, directx_native_dep ] + vkd3d_extra_libs,
   include_directories : vkd3d_private_includes)
 
 vkd3d_dep = declare_dependency(
   link_with           : [ vkd3d_lib, vkd3d_common_lib ],
-  dependencies        : [ vkd3d_extra_libs, vkd3d_common_dep ],
+  dependencies        : [ vkd3d_extra_libs, vkd3d_common_dep, directx_native_dep ],
   include_directories : vkd3d_public_includes)

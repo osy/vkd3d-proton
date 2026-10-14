@@ -177,6 +177,16 @@ vkd3d_version = vcs_tag(
 dxil_spirv = subproject('dxil-spirv')
 dxil_spirv_dep = dxil_spirv.get_variable('dxil_spirv_dep')
 
+if vkd3d_platform != 'windows'
+  directx_native = subproject('directx-native',
+    default_options : [ 'tests=false', 'install_headers=true' ])
+  directx_native_dep = directx_native.get_variable('directx_native_dep')
+  directx_native_headers_dep = directx_native.get_variable('directx_native_headers_dep')
+else
+  directx_native_dep = dependency('', required : false)
+  directx_native_headers_dep = dependency('', required : false)
+endif
+
 subdir('include')
 subdir('libs')
 

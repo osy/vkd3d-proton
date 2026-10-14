@@ -14,7 +14,7 @@ else
   # but dlopen will still find it since it is embedded in DT_RUNPATH (see objdump -p).
   # If the libraries are installed, the DT_RUNPATH is dropped, but at that point, LD_LIBRARY_PATH is more or less
   # expected.
-  d3d12_dependencies = [ vkd3d_common_dep, lib_dl, d3d12core_dep ]
+  d3d12_dependencies = [ vkd3d_common_dep, lib_dl, d3d12core_dep, directx_native_headers_dep ]
 endif
 
 d3d12_needs_defs = (not vkd3d_is_msvc) and (vkd3d_platform == 'windows')

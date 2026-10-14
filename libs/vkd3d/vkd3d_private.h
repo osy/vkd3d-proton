@@ -1227,7 +1227,7 @@ struct d3d12_resource
 #ifndef _WIN32
     /* Lazily built descriptor returned by ID3D12Device::CreateSharedHandle on
      * native builds.  Owned by the resource (including the dmabuf fd). */
-    struct DxvkSharedTextureDescriptor *native_shared_descriptor;
+    dxn_shared_texture *native_shared_descriptor;
 #endif
 };
 
@@ -7127,7 +7127,7 @@ struct DxvkSharedTextureMetadata {
     UINT             MiscFlags;
     D3D11_TEXTURE_LAYOUT TextureLayout;
 };
-#endif  /* On native builds, vkd3d_native_shared.h provides the layout-identical definition. */
+#endif
 
 bool vkd3d_set_shared_metadata(HANDLE handle, void *buf, uint32_t buf_size);
 bool vkd3d_get_shared_metadata(HANDLE handle, void *buf, uint32_t buf_size, uint32_t *metadata_size);
